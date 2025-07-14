@@ -7,6 +7,9 @@ defmodule AppuniteChatWeb.Live.Chat do
   @max_message_length Application.compile_env(:appunite_chat_web, :max_message_length, 200)
   @llm_response_timeout Application.compile_env(:appunite_chat_web, :llm_response_timeout, 60_000)
 
+  @default_error_message "Sorry, I can't help with that."
+  @processing_request_error "Sorry, I encountered an error processing your request. Please try again."
+
   defp init_agents do
     case AppuniteChat.Agents.WebQA.start_link() do
       {:ok, web_qa_agent_pid} ->
@@ -106,10 +109,8 @@ defmodule AppuniteChatWeb.Live.Chat do
     <%= case @message.originator do %>
       <% :user -> %>
         <div class="flex justify-end mb-4">
-          <div class="max-w-[80%] lg:max-w-[70%] bg-primary text-primary-content rounded-2xl rounded-br-md px-4 py-3 shadow-md">
-            <p class="text-sm leading-relaxed whitespace-pre-wrap break-words">
-              {@message.body}
-            </p>
+          <div class="max-w-[80%] lg:max-w-[70%] bg-primary text-base-content border border-base-300 rounded-2xl rounded-bl-md px-4 py-3 shadow-md">
+            <.markdown text={String.trim(@message.body)} />
           </div>
         </div>
       <% :llm -> %>
@@ -257,6 +258,9 @@ defmodule AppuniteChatWeb.Live.Chat do
           })
 
           tool_response
+        else
+          {:error, :topic_drift} ->
+            {:ok, %{result: "Sorry, I can't help with that."}}
         end
       catch
         :exit, {:timeout, _} ->
@@ -317,25 +321,25 @@ defmodule AppuniteChatWeb.Live.Chat do
       when socket.assigns.current_task.ref == ref do
     Process.demonitor(ref, [:flush])
 
-    case result do
-      {:ok, %{result: llm_message}} when is_binary(llm_message) ->
-        :telemetry.execute([:appunite_chat, :messages], %{received: 1}, %{message: llm_message})
+    message =
+      case result do
+        {:ok, %{result: llm_message}} when is_binary(llm_message) ->
+          :telemetry.execute([:appunite_chat, :messages], %{received: 1}, %{message: llm_message})
+          String.trim(llm_message)
 
-        ConversationHistory.add_message(
-          session_id,
-          ConversationHistory.Message.new(llm_message, :llm)
-        )
+        {:error, :topic_drift} ->
+          :telemetry.execute([:appunite_chat, :topic_drift], %{count: 1}, %{})
+          @default_error_message
 
-      _error ->
-        :telemetry.execute([:appunite_chat, :errors], %{total: 1}, %{type: "invalid_response"})
+        _error ->
+          :telemetry.execute([:appunite_chat, :errors], %{total: 1}, %{type: "invalid_response"})
+          @processing_request_error
+      end
 
-        error_message = "Sorry, I encountered an error processing your request. Please try again."
-
-        ConversationHistory.add_message(
-          session_id,
-          ConversationHistory.Message.new(error_message, :llm)
-        )
-    end
+    ConversationHistory.add_message(
+      session_id,
+      ConversationHistory.Message.new(message, :llm)
+    )
 
     {:noreply,
      assign(socket,
@@ -371,18 +375,20 @@ defmodule AppuniteChatWeb.Live.Chat do
         response
 
       {:error, _} ->
-        {:ok, %{result: "Sorry, I can't help with that."}}
+        {:ok, %{result: @default_error_message}}
     end
   end
 
   defp topic_drift_handler(pid, history) do
     case Agents.TopicDrift.boolean_response(pid, history) do
-      {:ok, %{result: _result}} = response ->
+      {:ok, %{result: true}} = response ->
         response
 
-      {:error, _} ->
-        :telemetry.execute([:appunite_chat, :topic_drift], %{count: 1}, %{})
-        {:ok, %{result: "Sorry, I can't help with that."}}
+      {:ok, %{result: false}} ->
+        {:error, :topic_drift}
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -390,7 +396,7 @@ defmodule AppuniteChatWeb.Live.Chat do
     if Enum.all?(pids, fn pid -> not is_nil(pid) end) do
       {:ok, %{result: ""}}
     else
-      {:ok, %{result: "Sorry, I can't help with that."}}
+      {:ok, %{result: @default_error_message}}
     end
   end
 end

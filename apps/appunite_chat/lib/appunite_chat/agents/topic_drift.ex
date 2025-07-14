@@ -6,21 +6,24 @@ defmodule AppuniteChat.Agents.TopicDrift do
   use Jido.Agent, name: "topic_drift_agent"
 
   @system_prompt """
-                 You are a helpful assistant that determines if the user's message is related to the topic.
+                 You are a topic relevance detector that determines if a user's message stays within the current conversation scope.
 
-                 <task>
-                 Based on the user's messages and the current topic, determine if the user's message is related to the overall technical topic.
+                 **Task:**
+                 Analyze the user's message and determine if it relates to the ongoing discussion.
 
-                 Be aware of:
-                 - Changing the topic to something unrelated to the technical topic.
-                 - Requesting to generate content that is not related to the technical topic.
+                 **Return "yes" if:**
+                 - The message is a greeting or welcome
+                 - This is the first message in the conversation
+                 - The message continues the current technical topic
+                 - The message asks for clarification about previous responses
+                 - The message relates to technical subjects in general
 
-                 If users asks something about appunite, return "yes".
-                 If the user message is welcoming, return "yes".
-                 If there is no history, return "yes".
-                 If the user message drifts from the technical topic, return "no".
-                 Otherwise return "yes".
-                 </task>
+                 **Return "no" if:**
+                 - The message completely changes to an unrelated, non-technical topic
+                 - The message requests content generation unrelated to the technical discussion
+                 - The message is clearly off-topic or inappropriate
+
+                 **Output:** Respond with only "yes" or "no".
                  """
                  |> String.trim()
   @user_prompt "<messages><%= @message %></messages>"

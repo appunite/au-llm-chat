@@ -1,0 +1,356 @@
+# AppUnite LLM Chat Demo
+
+```elixir
+Mix.install([
+  {:req, "~> 0.5"},
+  {:jason, "~> 1.2"},
+  {:kino, "~> 0.14.0"},
+  {:httpoison, "~> 2.0"},
+  {:livebook_env, "~> 1.0"},
+  {:jido_ai, github: "agentjido/jido_ai", branch: "main"}
+])
+```
+
+## Configuration
+
+Set env variables
+
+```elixir
+LivebookEnv.import_dotenv("/Users/Kamil/.env")
+```
+
+## Core Data Structures
+
+Define the essential data structures for our chat application
+
+```elixir
+defmodule Example.Message do
+  defstruct [:body, :originator, :timestamp]
+
+  def new(body, originator \\ :user) do
+    %__MODULE__{
+      body: body,
+      originator: originator,
+      timestamp: DateTime.utc_now()
+    }
+  end
+end
+
+defmodule Example.ConversationHistory do
+  use GenServer
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def init(_opts) do
+    :ets.new(__MODULE__, [:bag, :public, :named_table])
+    {:ok, %{}}
+  end
+
+  def add_message(session_id, message) do
+    :ets.insert(__MODULE__, {session_id, message})
+    :ok
+  end
+
+  def get_history(session_id) do
+    :ets.lookup(__MODULE__, session_id)
+    |> Enum.map(fn {_, message} -> message end)
+  end
+
+  def get_history_as_string(session_id) do
+    get_history(session_id)
+    |> Enum.map(fn message ->
+      originator = Atom.to_string(message.originator)
+      "<#{originator}>\n#{message.body}\n</#{originator}>"
+    end)
+    |> Enum.join("\n\n")
+  end
+end
+
+{:ok, _pid} = Example.ConversationHistory.start_link()
+```
+
+## Tavily Web Search Integration
+
+Minimal Tavily API client for web search functionality:
+
+```elixir
+defmodule Example.Tavily do
+  def search(query, opts \\ []) do
+    config = %{
+      tavily_api_key: System.get_env("TAVILY_API_KEY"),
+      tavily_api_url: "https://api.tavily.com/"
+    }
+
+    body = build_search_body(query, opts)
+
+    headers = [
+      {"Content-Type", "application/json"},
+      {"Authorization", "Bearer #{config.tavily_api_key}"}
+    ]
+
+    case HTTPoison.post("#{config.tavily_api_url}search", Jason.encode!(body), headers) do
+      {:ok, %{body: response_body}} ->
+        case Jason.decode(response_body) do
+          {:ok, decoded} -> {:ok, decoded}
+          {:error, error} -> {:error, "Failed to decode Tavily response: #{inspect(error)}"}
+        end
+      {:error, error} ->
+        {:error, "Tavily API request failed: #{inspect(error)}"}
+    end
+  end
+
+  defp build_search_body(query, opts) do
+    %{
+      query: query,
+      search_depth: Keyword.get(opts, :search_depth, "basic"),
+      include_answer: Keyword.get(opts, :include_answer, true),
+      include_raw_content: Keyword.get(opts, :include_raw_content, false),
+      max_results: Keyword.get(opts, :max_results, 5),
+      include_images: Keyword.get(opts, :include_images, false)
+    }
+  end
+end
+```
+
+## Web Search Tool
+
+Define web search tool that agents can re-use
+
+```elixir
+defmodule Example.Tools.WebSearch do
+  use Jido.Action,
+    name: "web_search",
+    description: "Search the web for information",
+    schema: [
+      query: [type: :string, doc: "The search query", default: ""]
+    ]
+
+  def run(params, _context) do
+    query = params.query || ""
+
+    if String.trim(query) == "" do
+      {:error, "Search query cannot be empty"}
+    else
+      case Example.Tavily.search(query) do
+        {:ok, response} ->
+          formatted_results = format_search_results(response)
+          {:ok, formatted_results}
+        {:error, reason} ->
+          {:error, "Web search failed: #{reason}"}
+      end
+    end
+  end
+
+  defp format_search_results(%{"results" => results}) do
+    formatted = results
+    |> Enum.take(5)
+    |> Enum.map(fn result ->
+      "Title: #{result["title"]}\nURL: #{result["url"]}\nContent: #{result["content"]}\n"
+    end)
+    |> Enum.join("\n---\n")
+
+    "Web search results:\n\n#{formatted}"
+  end
+
+  defp format_search_results(_), do: "No search results found"
+end
+```
+
+## AI Agents
+
+```elixir
+defmodule Example.Agents.TopicDrift do
+  use Jido.Agent, name: "topic_drift_agent"
+
+  @system_prompt """
+                 You are a topic relevance detector that determines if a user's message stays within the current conversation scope.
+
+                 **Task:**
+                 Analyze the user's message and determine if it relates to the ongoing discussion.
+
+                 **Return "yes" if:**
+                 - The message is a greeting or welcome
+                 - This is the first message in the conversation
+                 - The message continues the current technical topic
+                 - The message asks for clarification about previous responses
+                 - The message relates to technical subjects in general
+
+                 **Return "no" if:**
+                 - The message completely changes to an unrelated, non-technical topic
+                 - The message requests content generation unrelated to the technical discussion
+                 - The message is clearly off-topic or inappropriate
+
+                 **Output:** Respond with only "yes" or "no".
+                 """
+                 |> String.trim()
+
+  @user_prompt "<messages><%= @message %></messages>"
+
+  @agent_prompt Jido.AI.Prompt.new(%{
+    messages: [
+      %{role: :system, content: @system_prompt, engine: :eex},
+      %{role: :user, content: @user_prompt, engine: :eex}
+    ]
+  })
+
+  def start_link(_opts \\ %{}) do
+    Jido.AI.Agent.start_link(
+      agent: __MODULE__,
+      ai: [
+        model: {:openai, model: "gpt-4o"},
+        prompt: @agent_prompt,
+        verbose: false,
+        tools: []
+      ]
+    )
+  end
+
+  defdelegate boolean_response(pid, message, kwargs \\ []), to: Jido.AI.Agent
+end
+
+defmodule Example.Agents.WebQA do
+  use Jido.Agent, name: "web_qa_agent"
+
+  @system_prompt """
+                 ## Technical Assistant
+
+                 Today is <%= Date.utc_today() %>.You are a knowledgeable technical assistant that provides accurate, helpful answers to user questions.
+
+                 **Core Capabilities:**
+                 - Use web search when current knowledge is insufficient or when recent information is needed
+                 - Provide practical, actionable advice
+                 - Maintain accuracy and cite sources appropriately
+
+                 **Guidelines:**
+                 - If you need current information or want to verify facts, use the web search tool
+                 - When using web search, always include source URLs in your response
+                 - Focus on practical solutions that address the user's specific needs
+                 - Be honest about limitations and uncertainties
+
+                 **Response Format:**
+                 - Use clear, well-formatted markdown
+                 - Include proper headings and structure
+                 - When web search is used, add a "Sources:" section at the end listing all URLs
+                 - Separate distinct sections with `-------------`
+
+                 **Example Source Format:**
+                 Sources:
+                 - https://example.com/article1
+                 - https://example.com/article2
+                 """
+                 |> String.trim()
+
+  @user_prompt "<messages><%= @message %></messages>"
+
+  @agent_prompt Jido.AI.Prompt.new(%{
+    messages: [
+      %{role: :system, content: @system_prompt, engine: :eex},
+      %{role: :user, content: @user_prompt, engine: :eex}
+    ]
+  })
+
+  def start_link(_opts \\ %{}) do
+    Jido.AI.Agent.start_link(
+      agent: __MODULE__,
+      ai: [
+        model: {:openai, model: "gpt-4o"},
+        prompt: @agent_prompt,
+        verbose: false,
+        tools: [Example.Tools.WebSearch]
+      ]
+    )
+  end
+
+  defdelegate tool_response(pid, message, kwargs \\ []), to: Jido.AI.Agent
+end
+```
+
+## Chat
+
+Main chat engine that orchestrates everything
+
+```elixir
+defmodule Example.Chat do
+  def start_agents() do
+    with {:ok, topic_drift_pid} <- Example.Agents.TopicDrift.start_link(),
+         {:ok, web_qa_pid} <- Example.Agents.WebQA.start_link() do
+      {:ok, %{topic_drift: topic_drift_pid, web_qa: web_qa_pid}}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def process_message(message, session_id, agents) do
+    user_message = Example.Message.new(message, :user)
+    Example.ConversationHistory.add_message(session_id, user_message)
+
+    history = Example.ConversationHistory.get_history_as_string(session_id)
+
+    case check_topic_drift(history, agents.topic_drift) do
+      {:ok, %{result: true}} ->
+        generate_response(history, agents.web_qa, session_id)
+      {:error, _} ->
+        {:ok, %{result: "Sorry, I can't help with that."}}
+    end
+  end
+
+  defp check_topic_drift(history, topic_drift_agent) do
+    case Example.Agents.TopicDrift.boolean_response(topic_drift_agent, history) do
+      {:ok, %{result: true}} = response ->
+        response
+
+      {:ok, %{result: false}} ->
+        {:error, :topic_drift}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp generate_response(history, web_qa_agent, session_id) do
+    case Example.Agents.WebQA.tool_response(web_qa_agent, history, timeout: 30_000) do
+      {:ok, %{result: chat_completion}} = response ->
+        ai_message = Example.Message.new(chat_completion, :llm)
+        Example.ConversationHistory.add_message(session_id, ai_message)
+        response
+      {:error, :topic_drift} ->
+        {:error, "Sorry, I can't help with that."}
+    end
+  end
+end
+```
+
+## Interactive Demo
+
+Interactive demo interface using Kino, your conversation will appear below.
+
+```elixir
+{:ok, agents} = Example.Chat.start_agents()
+session_id = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+frame = Kino.Frame.new()
+```
+
+```elixir
+inputs = [message: Kino.Input.text("Message")]
+form = Kino.Control.form(inputs, submit: "Send", reset_on_submit: [:message])
+```
+
+```elixir
+for %{data: %{message: message}} <- Kino.Control.stream(form) do
+  content = Kino.Markdown.new("**You**: #{message}")
+  Kino.Frame.append(frame, content)
+
+  agent_reply = case Example.Chat.process_message(message, session_id, agents) do
+    {:ok, %{result: reply}} ->
+      reply
+
+    {:error, _} ->
+      "Sorry, I can't help with that."
+  end
+
+  llm_content = Kino.Markdown.new("**LLM**: #{agent_reply}")
+  Kino.Frame.append(frame, llm_content)
+end
+```
